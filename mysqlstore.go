@@ -1,31 +1,32 @@
-/* Gorilla Sessions backend for MySQL.
+// Gorilla Sessions backend for MySQL.
+//
+// Copyright (c) 2013 Contributors. See the list of contributors in the
+// CONTRIBUTORS file for details.
+//
+// This software is licensed under a MIT style license available in the
+// LICENSE file.
 
-Copyright (c) 2013 Contributors. See the list of contributors in the CONTRIBUTORS file for details.
-
-This software is licensed under a MIT style license available in the LICENSE file.
-*/
 package mysqlstore
 
 import (
 	"database/sql"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"github.com/go-sql-driver/mysql"
 	"github.com/gorilla/securecookie"
 	"github.com/gorilla/sessions"
-	"log"
 	"net/http"
 	"strings"
-	"time"
 )
 
+// MySQLStore stores the connection details for a session.
 type MySQLStore struct {
-	db         *sql.DB
-	stmtInsert *sql.Stmt
-	stmtDelete *sql.Stmt
-	stmtUpdate *sql.Stmt
-	stmtSelect *sql.Stmt
+	db          *sql.DB
+	stmtInsert  *sql.Stmt
+	stmtDelete  *sql.Stmt
+	stmtUpdate  *sql.Stmt
+	stmtSelect  *sql.Stmt
+	stmtCleanup *sql.Stmt
 
 	Codecs  []securecookie.Codec
 	Options *sessions.Options
@@ -33,17 +34,11 @@ type MySQLStore struct {
 }
 
 type sessionRow struct {
-	id         string
-	data       string
-	createdOn  time.Time
-	modifiedOn time.Time
-	expiresOn  time.Time
+	id   string
+	data string
 }
 
-func init() {
-	gob.Register(time.Time{})
-}
-
+// NewMySQLStore creates a new MySQLStore from a MySQL DSN.
 func NewMySQLStore(endpoint string, tableName string, path string, maxAge int, keyPairs ...[]byte) (*MySQLStore, error) {
 	db, err := sql.Open("mysql", endpoint)
 	if err != nil {
@@ -53,6 +48,8 @@ func NewMySQLStore(endpoint string, tableName string, path string, maxAge int, k
 	return NewMySQLStoreFromConnection(db, tableName, path, maxAge, keyPairs...)
 }
 
+// NewMySQLStoreFromConnection creates a new MySQLStore from an existing
+// MySQL database connection.
 func NewMySQLStoreFromConnection(db *sql.DB, tableName string, path string, maxAge int, keyPairs ...[]byte) (*MySQLStore, error) {
 	// Make sure table name is enclosed.
 	tableName = "`" + strings.Trim(tableName, "`") + "`"
@@ -62,7 +59,7 @@ func NewMySQLStoreFromConnection(db *sql.DB, tableName string, path string, maxA
 		"session_data LONGBLOB, " +
 		"created_on TIMESTAMP DEFAULT NOW(), " +
 		"modified_on TIMESTAMP NOT NULL DEFAULT NOW() ON UPDATE CURRENT_TIMESTAMP, " +
-		"expires_on TIMESTAMP DEFAULT NOW(), PRIMARY KEY(`id`)) ENGINE=InnoDB;"
+		"expires_on TIMESTAMP, PRIMARY KEY(`id`)) ENGINE=InnoDB;"
 	if _, err := db.Exec(cTableQ); err != nil {
 		switch err.(type) {
 		case *mysql.MySQLError:
@@ -77,8 +74,8 @@ func NewMySQLStoreFromConnection(db *sql.DB, tableName string, path string, maxA
 		}
 	}
 
-	insQ := "INSERT INTO " + tableName +
-		"(id, session_data, created_on, modified_on, expires_on) VALUES (NULL, ?, ?, ?, ?)"
+	insQ := "INSERT INTO " + tableName + "(id, session_data, expires_on) VALUES" +
+		fmt.Sprintf(" (NULL, ?, ADDDATE(NOW(), INTERVAL %d SECONDS))", maxAge)
 	stmtInsert, stmtErr := db.Prepare(insQ)
 	if stmtErr != nil {
 		return nil, stmtErr
@@ -90,27 +87,33 @@ func NewMySQLStoreFromConnection(db *sql.DB, tableName string, path string, maxA
 		return nil, stmtErr
 	}
 
-	updQ := "UPDATE " + tableName + " SET session_data = ?, created_on = ?, expires_on = ? " +
-		"WHERE id = ?"
+	updQ := "UPDATE " + tableName + " SET session_data = ? WHERE id = ?"
 	stmtUpdate, stmtErr := db.Prepare(updQ)
 	if stmtErr != nil {
 		return nil, stmtErr
 	}
 
-	selQ := "SELECT id, session_data, created_on, modified_on, expires_on from " +
+	selQ := "SELECT id, session_data, expired_on < NOW() FROM " +
 		tableName + " WHERE id = ?"
 	stmtSelect, stmtErr := db.Prepare(selQ)
 	if stmtErr != nil {
 		return nil, stmtErr
 	}
 
+	cleanQ := "DELETE FROM " + tableName + " WHERE expires_on < NOW()"
+	stmtCleanup, stmtErr := db.Prepare(cleanQ)
+	if stmtErr != nil {
+		return nil, stmtErr
+	}
+
 	return &MySQLStore{
-		db:         db,
-		stmtInsert: stmtInsert,
-		stmtDelete: stmtDelete,
-		stmtUpdate: stmtUpdate,
-		stmtSelect: stmtSelect,
-		Codecs:     securecookie.CodecsFromPairs(keyPairs...),
+		db:          db,
+		stmtInsert:  stmtInsert,
+		stmtDelete:  stmtDelete,
+		stmtUpdate:  stmtUpdate,
+		stmtSelect:  stmtSelect,
+		stmtCleanup: stmtCleanup,
+		Codecs:      securecookie.CodecsFromPairs(keyPairs...),
 		Options: &sessions.Options{
 			Path:   path,
 			MaxAge: maxAge,
@@ -119,18 +122,22 @@ func NewMySQLStoreFromConnection(db *sql.DB, tableName string, path string, maxA
 	}, nil
 }
 
+// Close closes all resources.
 func (m *MySQLStore) Close() {
 	m.stmtSelect.Close()
 	m.stmtUpdate.Close()
 	m.stmtDelete.Close()
 	m.stmtInsert.Close()
+	m.stmtCleanup.Close()
 	m.db.Close()
 }
 
+// Get gets session data.
 func (m *MySQLStore) Get(r *http.Request, name string) (*sessions.Session, error) {
 	return sessions.GetRegistry(r).Get(m, name)
 }
 
+// New creates a new session.
 func (m *MySQLStore) New(r *http.Request, name string) (*sessions.Session, error) {
 	session := sessions.NewSession(m, name)
 	session.Options = &sessions.Options{
@@ -156,6 +163,7 @@ func (m *MySQLStore) New(r *http.Request, name string) (*sessions.Session, error
 	return session, err
 }
 
+// Save saves the session.
 func (m *MySQLStore) Save(r *http.Request, w http.ResponseWriter, session *sessions.Session) error {
 	var err error
 	if session.ID == "" {
@@ -174,31 +182,11 @@ func (m *MySQLStore) Save(r *http.Request, w http.ResponseWriter, session *sessi
 }
 
 func (m *MySQLStore) insert(session *sessions.Session) error {
-	var createdOn time.Time
-	var modifiedOn time.Time
-	var expiresOn time.Time
-	crOn := session.Values["created_on"]
-	if crOn == nil {
-		createdOn = time.Now()
-	} else {
-		createdOn = crOn.(time.Time)
-	}
-	modifiedOn = createdOn
-	exOn := session.Values["expires_on"]
-	if exOn == nil {
-		expiresOn = time.Now().Add(time.Second * time.Duration(session.Options.MaxAge))
-	} else {
-		expiresOn = exOn.(time.Time)
-	}
-	delete(session.Values, "created_on")
-	delete(session.Values, "expires_on")
-	delete(session.Values, "modified_on")
-
 	encoded, encErr := securecookie.EncodeMulti(session.Name(), session.Values, m.Codecs...)
 	if encErr != nil {
 		return encErr
 	}
-	res, insErr := m.stmtInsert.Exec(encoded, createdOn, modifiedOn, expiresOn)
+	res, insErr := m.stmtInsert.Exec(encoded)
 	if insErr != nil {
 		return insErr
 	}
@@ -210,6 +198,7 @@ func (m *MySQLStore) insert(session *sessions.Session) error {
 	return nil
 }
 
+// Delete deletes a session.
 func (m *MySQLStore) Delete(r *http.Request, w http.ResponseWriter, session *sessions.Session) error {
 
 	// Set cookie to expire.
@@ -232,34 +221,12 @@ func (m *MySQLStore) save(session *sessions.Session) error {
 	if session.IsNew == true {
 		return m.insert(session)
 	}
-	var createdOn time.Time
-	var expiresOn time.Time
-	crOn := session.Values["created_on"]
-	if crOn == nil {
-		createdOn = time.Now()
-	} else {
-		createdOn = crOn.(time.Time)
-	}
 
-	exOn := session.Values["expires_on"]
-	if exOn == nil {
-		expiresOn = time.Now().Add(time.Second * time.Duration(session.Options.MaxAge))
-		log.Print("nil")
-	} else {
-		expiresOn = exOn.(time.Time)
-		if expiresOn.Sub(time.Now().Add(time.Second*time.Duration(session.Options.MaxAge))) < 0 {
-			expiresOn = time.Now().Add(time.Second * time.Duration(session.Options.MaxAge))
-		}
-	}
-
-	delete(session.Values, "created_on")
-	delete(session.Values, "expires_on")
-	delete(session.Values, "modified_on")
 	encoded, encErr := securecookie.EncodeMulti(session.Name(), session.Values, m.Codecs...)
 	if encErr != nil {
 		return encErr
 	}
-	_, updErr := m.stmtUpdate.Exec(encoded, createdOn, expiresOn, session.ID)
+	_, updErr := m.stmtUpdate.Exec(encoded, session.ID)
 	if updErr != nil {
 		return updErr
 	}
@@ -269,21 +236,18 @@ func (m *MySQLStore) save(session *sessions.Session) error {
 func (m *MySQLStore) load(session *sessions.Session) error {
 	row := m.stmtSelect.QueryRow(session.ID)
 	sess := sessionRow{}
-	scanErr := row.Scan(&sess.id, &sess.data, &sess.createdOn, &sess.modifiedOn, &sess.expiresOn)
+	var expired bool
+	scanErr := row.Scan(&sess.id, &sess.data, &expired)
 	if scanErr != nil {
 		return scanErr
 	}
-	if sess.expiresOn.Sub(time.Now()) < 0 {
-		log.Printf("Session expired on %s, but it is %s now.", sess.expiresOn, time.Now())
+	if expired {
 		return errors.New("Session expired")
 	}
 	err := securecookie.DecodeMulti(session.Name(), sess.data, &session.Values, m.Codecs...)
 	if err != nil {
 		return err
 	}
-	session.Values["created_on"] = sess.createdOn
-	session.Values["modified_on"] = sess.modifiedOn
-	session.Values["expires_on"] = sess.expiresOn
 	return nil
 
 }
