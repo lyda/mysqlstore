@@ -75,7 +75,7 @@ func NewMySQLStoreFromConnection(db *sql.DB, tableName string, path string, maxA
 	}
 
 	insQ := "INSERT INTO " + tableName + "(id, session_data, expires_on) VALUES" +
-		fmt.Sprintf(" (NULL, ?, ADDDATE(NOW(), INTERVAL %d SECONDS))", maxAge)
+		fmt.Sprintf(" (NULL, ?, ADDDATE(NOW(), INTERVAL %d SECOND))", maxAge)
 	stmtInsert, stmtErr := db.Prepare(insQ)
 	if stmtErr != nil {
 		return nil, stmtErr
@@ -93,7 +93,7 @@ func NewMySQLStoreFromConnection(db *sql.DB, tableName string, path string, maxA
 		return nil, stmtErr
 	}
 
-	selQ := "SELECT id, session_data, expired_on < NOW() FROM " +
+	selQ := "SELECT id, session_data, expires_on < NOW() FROM " +
 		tableName + " WHERE id = ?"
 	stmtSelect, stmtErr := db.Prepare(selQ)
 	if stmtErr != nil {
